@@ -1,5 +1,5 @@
 name:                ekg-prometheus-adapter
-version:             0.1.0.2
+version:             0.1.0.3
 synopsis:            Easily expose your EKG metrics to Prometheus
 description:         Please see README.md
 homepage:            https://github.com/adinapoli/ekg-prometheus-adapter#readme

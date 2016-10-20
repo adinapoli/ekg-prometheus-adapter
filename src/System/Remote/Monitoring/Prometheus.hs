@@ -6,6 +6,9 @@ module System.Remote.Monitoring.Prometheus
   ( toPrometheusRegistry
   , registerEKGStore
   , AdapterOptions(..)
+  , labels
+  , namespace
+  , samplingFrequency
   , defaultOptions
   ) where
 
