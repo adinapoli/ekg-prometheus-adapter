@@ -1,5 +1,6 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
 module System.Remote.Monitoring.Prometheus
   ( toPrometheusRegistry
@@ -15,6 +16,7 @@ import           Control.Monad.Trans.State.Strict
 import qualified Data.HashMap.Strict as HMap
 import qualified Data.Map.Strict as Map
 import           Data.Monoid
+import Lens.Micro.TH
 import qualified Data.Text as T
 import qualified System.Metrics as EKG
 import qualified System.Metrics.Prometheus.Metric.Counter as Counter
@@ -25,11 +27,13 @@ import           System.Metrics.Prometheus.RegistryT (RegistryT(..))
 
 --------------------------------------------------------------------------------
 data AdapterOptions = AdapterOptions {
-    labels :: Prometheus.Labels
-  , namespace :: Maybe T.Text
-  , samplingFrequency :: !Int
+    _labels :: Prometheus.Labels
+  , _namespace :: Maybe T.Text
+  , _samplingFrequency :: !Int
     -- ^ How often update the registry (in seconds).
   }
+
+makeLenses ''AdapterOptions
 
 --------------------------------------------------------------------------------
 data Metric =
@@ -48,7 +52,7 @@ registerEKGStore store opts = RegistryT $ StateT $ \_ -> do
   (r, mmap) <- liftIO $ toPrometheusRegistry' store opts
   liftIO $ forkIO $ do
     let loop = forever $ do
-                 threadDelay (samplingFrequency opts * 10^6)
+                 threadDelay (_samplingFrequency opts * 10^6)
                  updateMetrics store opts mmap
                  loop
     loop
@@ -68,14 +72,14 @@ toPrometheusRegistry store opts = fst <$> toPrometheusRegistry' store opts
 --------------------------------------------------------------------------------
 mkMetric :: AdapterOptions -> (Prometheus.Registry, MetricsMap) -> (T.Text, EKG.Value) -> IO (Prometheus.Registry, MetricsMap)
 mkMetric AdapterOptions{..} (oldRegistry, mmap) (key, value) = do
-  let k = mkKey namespace key
+  let k = mkKey _namespace key
   case value of
    EKG.Counter c -> do
-     (counter, newRegistry) <- Prometheus.registerCounter k labels oldRegistry
+     (counter, newRegistry) <- Prometheus.registerCounter k _labels oldRegistry
      Counter.add (fromIntegral c) counter
      return $! (newRegistry, Map.insert k (C counter) $! mmap)
    EKG.Gauge g   -> do
-     (gauge, newRegistry) <- Prometheus.registerGauge k labels oldRegistry
+     (gauge, newRegistry) <- Prometheus.registerGauge k _labels oldRegistry
      Gauge.set (fromIntegral g) gauge
      return $! (newRegistry, Map.insert k (G gauge) $! mmap)
    EKG.Label _   -> return $! (oldRegistry, mmap)
@@ -96,7 +100,7 @@ mkKey mbNs k =
 --------------------------------------------------------------------------------
 updateMetric :: AdapterOptions -> MetricsMap -> (T.Text, EKG.Value) -> IO MetricsMap
 updateMetric AdapterOptions{..} mmap (key, value) = do
-  let k = mkKey namespace key
+  let k = mkKey _namespace key
   case liftM2 (,) (Map.lookup k mmap) (Just value) of
     Just (C counter, EKG.Counter c)  -> do
       (Counter.CounterSample oldCounterValue) <- Counter.sample counter
