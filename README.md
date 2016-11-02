@@ -6,7 +6,7 @@ also exposing a function to "inject" the newly created `Registry` into your `Reg
 
 ### Example
 
-The following example demostrates how you can use this library to expose to Prometheus various
+The following example demonstrates how you can use this library to expose to Prometheus various
 GHC RTS's metrics whilst still defining your application-specific metrics.
 
 ``` haskell
