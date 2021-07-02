@@ -12,23 +12,23 @@ module System.Remote.Monitoring.Prometheus
   , updateMetrics
   ) where
 
-import           Control.Concurrent (forkIO, threadDelay)
 import           Control.Monad
 import           Control.Monad.IO.Class
 import           Control.Monad.Trans.Reader (runReaderT)
 import Data.Foldable
 import qualified Data.HashMap.Strict as HMap
+import Data.Int
 import qualified Data.Map.Strict as Map
-import           Data.Monoid
 import Lens.Micro.TH
 import qualified Data.Text as T
 import qualified System.Metrics as EKG
+import qualified System.Metrics.Distribution as EKG
 import qualified System.Metrics.Prometheus.Metric.Counter as Counter
 import qualified System.Metrics.Prometheus.Metric.Gauge as Gauge
 import qualified System.Metrics.Prometheus.MetricId as Prometheus
 import qualified System.Metrics.Prometheus.Concurrent.Registry as Prometheus
 import System.Metrics.Prometheus.Registry (RegistrySample)
-import           System.Metrics.Prometheus.Concurrent.RegistryT (RegistryT(..), runRegistryT)
+import           System.Metrics.Prometheus.Concurrent.RegistryT (RegistryT(..))
 
 --------------------------------------------------------------------------------
 data AdapterOptions = AdapterOptions {
@@ -39,9 +39,19 @@ data AdapterOptions = AdapterOptions {
 makeLenses ''AdapterOptions
 
 --------------------------------------------------------------------------------
+data Distribution = Distribution
+  { meanG :: Gauge.Gauge
+  , varianceG :: Gauge.Gauge
+  , countC :: Counter.Counter
+  , sumG :: Gauge.Gauge
+  , minG :: Gauge.Gauge
+  , maxG :: Gauge.Gauge
+  }
+
 data Metric =
     C Counter.Counter
   | G Gauge.Gauge
+  | D Distribution
 
 type MetricsMap = Map.Map Prometheus.Name Metric
 
@@ -82,8 +92,34 @@ mkMetric AdapterOptions{..} registry mmap (key, value) = do
      Gauge.set (fromIntegral g) gauge
      return $! Map.insert k (G gauge) $! mmap
    EKG.Label _   -> return $! mmap
-   EKG.Distribution _ -> return $! mmap
+   EKG.Distribution stats -> do
+     let statGauge name = do
+           gauge <- Prometheus.registerGauge k ( Prometheus.addLabel "stat" name _labels) registry
+           return gauge
+     meanG <- statGauge "mean"
+     varianceG <- statGauge"variance"
+     countC <- Prometheus.registerCounter k (Prometheus.addLabel "stat" "count" _labels) registry
+     sumG <- statGauge"sum"
+     minG <- statGauge"min"
+     maxG <- statGauge"max"
+     let distribution = Distribution {..}
+     updateDistribution distribution stats
+     return $! Map.insert k (D Distribution {..}) mmap
 
+updateDistribution :: Distribution -> EKG.Stats -> IO ()
+updateDistribution Distribution{..} stats = do
+  Gauge.set (EKG.mean stats) meanG
+  Gauge.set (EKG.variance stats) varianceG
+  Gauge.set (EKG.sum stats) sumG
+  Gauge.set (EKG.min stats) minG
+  Gauge.set (EKG.max stats) maxG
+  updateCounter countC (EKG.count stats)
+
+updateCounter :: Counter.Counter -> Int64 -> IO ()
+updateCounter counter c = do
+  (Counter.CounterSample oldCounterValue) <- Counter.sample counter
+  let slack = c - fromIntegral oldCounterValue
+  when (slack >= 0) $ Counter.add (fromIntegral slack) counter
 --------------------------------------------------------------------------------
 updateMetrics :: EKG.Store -> AdapterOptions -> MetricsMap -> IO ()
 updateMetrics store opts mmap = do
@@ -93,7 +129,7 @@ updateMetrics store opts mmap = do
 --------------------------------------------------------------------------------
 mkKey :: Maybe T.Text -> T.Text -> Prometheus.Name
 mkKey mbNs k =
-  Prometheus.Name $ (maybe mempty (\x -> x <> "_") mbNs) <> T.replace "." "_" k
+  Prometheus.Name $ maybe mempty (<> "_") mbNs <> T.replace "." "_" k
 
 --------------------------------------------------------------------------------
 updateMetric :: AdapterOptions -> MetricsMap -> (T.Text, EKG.Value) -> IO ()
@@ -101,10 +137,7 @@ updateMetric AdapterOptions{..} mmap (key, value) = do
   let k = mkKey _namespace key
   case (Map.lookup k mmap, value) of
     -- TODO if we don't have a metric registered, register one
-    (Just (C counter), EKG.Counter c)  -> do
-      (Counter.CounterSample oldCounterValue) <- Counter.sample counter
-      let slack = c - fromIntegral oldCounterValue
-      when (slack >= 0) $ Counter.add (fromIntegral slack) counter
-    (Just (G gauge),   EKG.Gauge g) -> do
-      Gauge.set (fromIntegral g) gauge
+    (Just (C counter), EKG.Counter c)  -> updateCounter counter c
+    (Just (G gauge),   EKG.Gauge g) -> Gauge.set (fromIntegral g) gauge
+    (Just (D distribution), EKG.Distribution stats) -> updateDistribution distribution stats
     _ -> return ()
