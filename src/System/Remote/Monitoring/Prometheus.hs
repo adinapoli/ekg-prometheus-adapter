@@ -1,3 +1,6 @@
+{-# LANGUAGE GeneralisedNewtypeDeriving #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TemplateHaskell #-}
@@ -12,6 +15,8 @@ module System.Remote.Monitoring.Prometheus
   , updateMetrics
   ) where
 
+import Data.Hashable (Hashable)
+import Data.Maybe (catMaybes)
 import           Control.Monad
 import           Control.Monad.IO.Class
 import           Control.Monad.Trans.Reader (runReaderT)
@@ -53,7 +58,9 @@ data Metric =
   | G Gauge.Gauge
   | D Distribution
 
-type MetricsMap = Map.Map Prometheus.Name Metric
+deriving newtype instance Hashable Prometheus.Name
+
+type MetricsMap = HMap.HashMap Prometheus.Name Metric
 
 --------------------------------------------------------------------------------
 defaultOptions :: Prometheus.Labels -> AdapterOptions
@@ -71,7 +78,7 @@ toPrometheusRegistry' :: EKG.Store -> AdapterOptions -> IO (Prometheus.Registry,
 toPrometheusRegistry' store opts = do
   registry <- Prometheus.new
   samples <- EKG.sampleAll store
-  mmap <- foldM (mkMetric opts registry) Map.empty (HMap.toList samples)
+  mmap <- HMap.fromList . catMaybes <$> traverse (mkMetric opts registry) (HMap.toList samples)
   return (registry, mmap)
 
 --------------------------------------------------------------------------------
@@ -79,19 +86,19 @@ toPrometheusRegistry :: EKG.Store -> AdapterOptions -> IO Prometheus.Registry
 toPrometheusRegistry store opts = fst <$> toPrometheusRegistry' store opts
 
 --------------------------------------------------------------------------------
-mkMetric :: AdapterOptions -> Prometheus.Registry -> MetricsMap -> (T.Text, EKG.Value) -> IO MetricsMap
-mkMetric AdapterOptions{..} registry mmap (key, value) = do
+mkMetric :: AdapterOptions -> Prometheus.Registry -> (T.Text, EKG.Value) -> IO (Maybe (Prometheus.Name, Metric))
+mkMetric AdapterOptions{..} registry (key, value) = do
   let k = mkKey _namespace key
   case value of
    EKG.Counter c -> do
      counter <- Prometheus.registerCounter k _labels registry
      Counter.add (fromIntegral c) counter
-     return $! Map.insert k (C counter) $! mmap
+     return (Just (k, C counter))
    EKG.Gauge g   -> do
      gauge <- Prometheus.registerGauge k _labels registry
      Gauge.set (fromIntegral g) gauge
-     return $! Map.insert k (G gauge) $! mmap
-   EKG.Label _   -> return $! mmap
+     return (Just (k, G gauge))
+   EKG.Label _   -> return Nothing
    EKG.Distribution stats -> do
      let statGauge name = do
            gauge <- Prometheus.registerGauge k ( Prometheus.addLabel "stat" name _labels) registry
@@ -104,7 +111,7 @@ mkMetric AdapterOptions{..} registry mmap (key, value) = do
      maxG <- statGauge"max"
      let distribution = Distribution {..}
      updateDistribution distribution stats
-     return $! Map.insert k (D Distribution {..}) mmap
+     return (Just (k, D Distribution {..}))
 
 updateDistribution :: Distribution -> EKG.Stats -> IO ()
 updateDistribution Distribution{..} stats = do
@@ -135,7 +142,7 @@ mkKey mbNs k =
 updateMetric :: AdapterOptions -> MetricsMap -> (T.Text, EKG.Value) -> IO ()
 updateMetric AdapterOptions{..} mmap (key, value) = do
   let k = mkKey _namespace key
-  case (Map.lookup k mmap, value) of
+  case (HMap.lookup k mmap, value) of
     -- TODO if we don't have a metric registered, register one
     (Just (C counter), EKG.Counter c)  -> updateCounter counter c
     (Just (G gauge),   EKG.Gauge g) -> Gauge.set (fromIntegral g) gauge

@@ -21,6 +21,7 @@ library
                      , ekg-core
                      , unordered-containers
                      , containers
+                     , hashable
                      , text
                      , transformers
                      , microlens-th
