@@ -68,12 +68,12 @@ defaultOptions :: Prometheus.Labels -> AdapterOptions
 defaultOptions l = AdapterOptions l Nothing
 
 --------------------------------------------------------------------------------
-registerEKGStore :: MonadIO m => EKG.Store -> AdapterOptions -> RegistryT m () -> m (IO RegistrySample)
-registerEKGStore store opts registryAction = do
+registerEKGStore :: MonadIO m =>
+  EKG.Store -> AdapterOptions -> m (Prometheus.Registry, IO RegistrySample)
+registerEKGStore store opts = do
   (registry, mmap) <- liftIO $ toPrometheusRegistry' store opts
-  runReaderT (unRegistryT registryAction) registry
   mv <- liftIO $ newMVar mmap
-  return (updateMetrics store opts registry mv >> Prometheus.sample registry)
+  return (registry, updateMetrics store opts registry mv >> Prometheus.sample registry)
 
 --------------------------------------------------------------------------------
 toPrometheusRegistry' :: EKG.Store -> AdapterOptions -> IO (Prometheus.Registry, MetricsMap)
