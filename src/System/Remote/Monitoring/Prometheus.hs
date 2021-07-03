@@ -15,6 +15,7 @@ module System.Remote.Monitoring.Prometheus
   , updateMetrics
   ) where
 
+import Control.Concurrent.MVar
 import Data.Hashable (Hashable)
 import Data.Maybe (catMaybes)
 import           Control.Monad
@@ -71,7 +72,8 @@ registerEKGStore :: MonadIO m => EKG.Store -> AdapterOptions -> RegistryT m () -
 registerEKGStore store opts registryAction = do
   (registry, mmap) <- liftIO $ toPrometheusRegistry' store opts
   runReaderT (unRegistryT registryAction) registry
-  return (updateMetrics store opts mmap >> Prometheus.sample registry)
+  mv <- liftIO $ newMVar mmap
+  return (updateMetrics store opts registry mv >> Prometheus.sample registry)
 
 --------------------------------------------------------------------------------
 toPrometheusRegistry' :: EKG.Store -> AdapterOptions -> IO (Prometheus.Registry, MetricsMap)
@@ -128,10 +130,10 @@ updateCounter counter c = do
   let slack = c - fromIntegral oldCounterValue
   when (slack >= 0) $ Counter.add (fromIntegral slack) counter
 --------------------------------------------------------------------------------
-updateMetrics :: EKG.Store -> AdapterOptions -> MetricsMap -> IO ()
-updateMetrics store opts mmap = do
+updateMetrics :: EKG.Store -> AdapterOptions -> Prometheus.Registry -> MVar MetricsMap -> IO ()
+updateMetrics store opts registry mmap = do
   samples <- EKG.sampleAll store
-  traverse_ (updateMetric opts mmap) (HMap.toList samples)
+  traverse_ (updateMetric opts registry mmap) (HMap.toList samples)
 
 --------------------------------------------------------------------------------
 mkKey :: Maybe T.Text -> T.Text -> Prometheus.Name
@@ -139,12 +141,24 @@ mkKey mbNs k =
   Prometheus.Name $ maybe mempty (<> "_") mbNs <> T.replace "." "_" k
 
 --------------------------------------------------------------------------------
-updateMetric :: AdapterOptions -> MetricsMap -> (T.Text, EKG.Value) -> IO ()
-updateMetric AdapterOptions{..} mmap (key, value) = do
+updateMetric :: AdapterOptions -> Prometheus.Registry -> MVar MetricsMap -> (T.Text, EKG.Value) -> IO ()
+updateMetric opts@AdapterOptions{..} registry mv kv@(key, value) = do
   let k = mkKey _namespace key
-  case (HMap.lookup k mmap, value) of
-    -- TODO if we don't have a metric registered, register one
-    (Just (C counter), EKG.Counter c)  -> updateCounter counter c
-    (Just (G gauge),   EKG.Gauge g) -> Gauge.set (fromIntegral g) gauge
-    (Just (D distribution), EKG.Distribution stats) -> updateDistribution distribution stats
-    _ -> return ()
+  mmap <- readMVar mv
+  case HMap.lookup k mmap of
+    Just metric -> updateMetric' metric value
+    Nothing -> modifyMVar_ mv $ \mmap -> do
+      -- take the MMap MVar before the Registry, so we never register two metrics for the same EKG
+      m_metric <- mkMetric opts registry kv
+      case m_metric of
+        Nothing -> return mmap
+        Just (_, metric) -> do
+          updateMetric' metric value
+          return $ HMap.insert k metric mmap
+  where
+    updateMetric' :: Metric -> EKG.Value -> IO ()
+    updateMetric' metric value = case (metric, value) of
+      (C counter, EKG.Counter c)  -> updateCounter counter c
+      (G gauge,   EKG.Gauge g) -> Gauge.set (fromIntegral g) gauge
+      (D distribution, EKG.Distribution stats) -> updateDistribution distribution stats
+      _ -> return ()
