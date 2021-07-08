@@ -138,7 +138,12 @@ updateMetrics store opts registry mmap = do
 --------------------------------------------------------------------------------
 mkKey :: Maybe T.Text -> T.Text -> Prometheus.Name
 mkKey mbNs k =
-  Prometheus.Name $ maybe mempty (<> "_") mbNs <> T.replace "." "_" k
+  -- TODO forbid digit as first character
+  Prometheus.Name $ ns <> T.map replace_ k
+  where
+    ns = maybe mempty (<> "_") mbNs
+    allowed c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+    replace_ c = if allowed c then c else '_'
 
 --------------------------------------------------------------------------------
 updateMetric :: AdapterOptions -> Prometheus.Registry -> MVar MetricsMap -> (T.Text, EKG.Value) -> IO ()
