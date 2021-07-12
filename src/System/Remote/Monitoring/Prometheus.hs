@@ -90,6 +90,7 @@ defaultOptions l = AdapterOptions l Nothing
 forkBoth :: AdapterOptions -> Port -> IO Server
 forkBoth opts port = myThreadId >>= \caller -> do
   ekgStore <- EKG.newStore
+  EKG.registerGcMetrics ekgStore
   EKG.registerCounter "ekg.server_timestamp_ms" getTimeMs ekgStore
   (prometheusRegistry, sample) <- registerEKGStore ekgStore opts
   let
