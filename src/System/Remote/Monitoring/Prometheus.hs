@@ -1,3 +1,5 @@
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE GeneralisedNewtypeDeriving #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE DerivingStrategies #-}
@@ -8,13 +10,22 @@
 module System.Remote.Monitoring.Prometheus
   ( toPrometheusRegistry
   , registerEKGStore
+  , forkBoth
   , AdapterOptions(..)
+  , Server(..)
   , labels
   , namespace
   , defaultOptions
   , updateMetrics
   ) where
 
+import Network.Socket (withSocketsDo)
+import           Network.Wai (Application, pathInfo)
+import           Network.Wai.Handler.Warp (Port, run)
+import Data.ByteString (ByteString)
+import System.Metrics.Prometheus.Http.Scrape (prometheusApp)
+import Control.Concurrent (ThreadId, myThreadId, forkFinally, throwTo)
+import GHC.Clock (getMonotonicTimeNSec)
 import Control.Concurrent.MVar
 import Data.Hashable (Hashable)
 import Data.Maybe (catMaybes)
@@ -29,6 +40,7 @@ import Lens.Micro.TH
 import qualified Data.Text as T
 import qualified System.Metrics as EKG
 import qualified System.Metrics.Distribution as EKG
+import qualified System.Remote.Monitoring.Wai as EKG
 import qualified System.Metrics.Prometheus.Metric.Counter as Counter
 import qualified System.Metrics.Prometheus.Metric.Gauge as Gauge
 import qualified System.Metrics.Prometheus.MetricId as Prometheus
@@ -63,9 +75,39 @@ deriving newtype instance Hashable Prometheus.Name
 
 type MetricsMap = HMap.HashMap Prometheus.Name Metric
 
+data Server = Server
+  { threadId :: ThreadId
+  , ekgStore :: EKG.Store
+  , prometheusRegistry :: Prometheus.Registry
+  }
+
 --------------------------------------------------------------------------------
 defaultOptions :: Prometheus.Labels -> AdapterOptions
 defaultOptions l = AdapterOptions l Nothing
+
+-- | host EKG & Prometheus metrics on the same port.
+-- Prometheus will be at @/metrics@ and EKG at @/@
+forkBoth :: AdapterOptions -> Port -> IO Server
+forkBoth opts port = myThreadId >>= \caller -> do
+  ekgStore <- EKG.newStore
+  EKG.registerCounter "ekg.server_timestamp_ms" getTimeMs ekgStore
+  (prometheusRegistry, sample) <- registerEKGStore ekgStore opts
+  let
+    promApp = prometheusApp ["metrics"] sample
+    ekgApp = EKG.monitor ekgStore
+    joinedApps :: Application
+    joinedApps req = case pathInfo req of
+      ("metrics" : _) -> promApp req
+      _ -> ekgApp req
+  threadId <- withSocketsDo $ forkFinally (run port joinedApps) $ \ r ->
+    case r of
+      Left e  -> throwTo caller e
+      Right _ -> return ()
+  return $! Server {threadId, ekgStore, prometheusRegistry}
+  where
+    getTimeMs :: IO Int64
+    getTimeMs = fromIntegral .  (`div` 1_000_000) <$> getMonotonicTimeNSec
+
 
 --------------------------------------------------------------------------------
 registerEKGStore :: MonadIO m =>
