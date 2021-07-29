@@ -137,7 +137,8 @@ mkMetric AdapterOptions{..} registry (key, value) = do
   case value of
    EKG.Counter c -> do
      counter <- Prometheus.registerCounter k _labels registry
-     Counter.add (fromIntegral c) counter
+     let c' = fromIntegral c
+     when (c' > 0) (Counter.add c' counter)
      return (Just (k, C counter))
    EKG.Gauge g   -> do
      gauge <- Prometheus.registerGauge k _labels registry
