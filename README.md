@@ -1,6 +1,8 @@
 
 ## ekg-prometheus-adapter
 
+[![Build status](https://github.com/adinapoli/ekg-prometheus-adapter/actions/workflows/ci.yml/badge.svg)](https://github.com/adinapoli/ekg-prometheus-adapter/actions/workflows/ci.yml)
+
 Simple library which maps an EKG's `Store` into a [prometheus](http://hackage.haskell.org/package/prometheus)'s `Registry`,
 also exposing a function to "inject" the newly created `Registry` into your `RegistryT` computation.
 
