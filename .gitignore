@@ -1,2 +1,4 @@
 .stack-work
 tags
+dist-newstyle
+*.lock
