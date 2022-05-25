@@ -1,3 +1,8 @@
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE NumericUnderscores #-}
+{-# LANGUAGE GeneralisedNewtypeDeriving #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TemplateHaskell #-}
@@ -5,112 +10,204 @@
 module System.Remote.Monitoring.Prometheus
   ( toPrometheusRegistry
   , registerEKGStore
+  , forkBoth
   , AdapterOptions(..)
+  , Server(..)
   , labels
   , namespace
-  , samplingFrequency
   , defaultOptions
+  , updateMetrics
   ) where
 
-import           Control.Concurrent (forkIO, threadDelay)
+import Network.Socket (withSocketsDo)
+import           Network.Wai (Application, pathInfo)
+import           Network.Wai.Handler.Warp (Port, run)
+import Data.ByteString (ByteString)
+import System.Metrics.Prometheus.Http.Scrape (prometheusApp)
+import Control.Concurrent (ThreadId, myThreadId, forkFinally, throwTo)
+import GHC.Clock (getMonotonicTimeNSec)
+import Control.Concurrent.MVar
+import Data.Hashable (Hashable)
+import Data.Maybe (catMaybes)
 import           Control.Monad
 import           Control.Monad.IO.Class
-import           Control.Monad.Trans.State.Strict
+import           Control.Monad.Trans.Reader (runReaderT)
+import Data.Foldable
 import qualified Data.HashMap.Strict as HMap
+import Data.Int
 import qualified Data.Map.Strict as Map
-import           Data.Monoid
 import Lens.Micro.TH
 import qualified Data.Text as T
 import qualified System.Metrics as EKG
+import qualified System.Metrics.Distribution as EKG
+import qualified System.Remote.Monitoring.Wai as EKG
 import qualified System.Metrics.Prometheus.Metric.Counter as Counter
 import qualified System.Metrics.Prometheus.Metric.Gauge as Gauge
 import qualified System.Metrics.Prometheus.MetricId as Prometheus
-import qualified System.Metrics.Prometheus.Registry as Prometheus
-import           System.Metrics.Prometheus.RegistryT (RegistryT(..))
+import qualified System.Metrics.Prometheus.Concurrent.Registry as Prometheus
+import System.Metrics.Prometheus.Registry (RegistrySample)
+import           System.Metrics.Prometheus.Concurrent.RegistryT (RegistryT(..))
 
 --------------------------------------------------------------------------------
 data AdapterOptions = AdapterOptions {
     _labels :: Prometheus.Labels
   , _namespace :: Maybe T.Text
-  , _samplingFrequency :: !Int
-    -- ^ How often update the registry (in seconds).
   }
 
 makeLenses ''AdapterOptions
 
 --------------------------------------------------------------------------------
+data Distribution = Distribution
+  { meanG :: Gauge.Gauge
+  , varianceG :: Gauge.Gauge
+  , countC :: Counter.Counter
+  , sumG :: Gauge.Gauge
+  , minG :: Gauge.Gauge
+  , maxG :: Gauge.Gauge
+  }
+
 data Metric =
     C Counter.Counter
   | G Gauge.Gauge
+  | D Distribution
 
-type MetricsMap = Map.Map Prometheus.Name Metric
+deriving newtype instance Hashable Prometheus.Name
+
+type MetricsMap = HMap.HashMap Prometheus.Name Metric
+
+data Server = Server
+  { threadId :: ThreadId
+  , ekgStore :: EKG.Store
+  , prometheusRegistry :: Prometheus.Registry
+  }
 
 --------------------------------------------------------------------------------
 defaultOptions :: Prometheus.Labels -> AdapterOptions
-defaultOptions l = AdapterOptions l Nothing 15
+defaultOptions l = AdapterOptions l Nothing
+
+-- | host EKG & Prometheus metrics on the same port.
+-- Prometheus will be at @/metrics@ and EKG at @/@
+forkBoth :: AdapterOptions -> Port -> IO Server
+forkBoth opts port = myThreadId >>= \caller -> do
+  ekgStore <- EKG.newStore
+  EKG.registerGcMetrics ekgStore
+  EKG.registerCounter "ekg.server_timestamp_ms" getTimeMs ekgStore
+  (prometheusRegistry, sample) <- registerEKGStore ekgStore opts
+  let
+    promApp = prometheusApp ["metrics"] sample
+    ekgApp = EKG.monitor ekgStore
+    joinedApps :: Application
+    joinedApps req = case pathInfo req of
+      ("metrics" : _) -> promApp req
+      _ -> ekgApp req
+  threadId <- withSocketsDo $ forkFinally (run port joinedApps) $ \ r ->
+    case r of
+      Left e  -> throwTo caller e
+      Right _ -> return ()
+  return $! Server {threadId, ekgStore, prometheusRegistry}
+  where
+    getTimeMs :: IO Int64
+    getTimeMs = fromIntegral .  (`div` 1_000_000) <$> getMonotonicTimeNSec
+
 
 --------------------------------------------------------------------------------
-registerEKGStore :: MonadIO m => EKG.Store -> AdapterOptions -> RegistryT m ()
-registerEKGStore store opts = RegistryT $ StateT $ \_ -> do
-  (r, mmap) <- liftIO $ toPrometheusRegistry' store opts
-  liftIO $ forkIO $ do
-    let loop = forever $ do
-                 threadDelay (_samplingFrequency opts * 10^6)
-                 updateMetrics store opts mmap
-                 loop
-    loop
-  return ((), r)
+registerEKGStore :: MonadIO m =>
+  EKG.Store -> AdapterOptions -> m (Prometheus.Registry, IO RegistrySample)
+registerEKGStore store opts = do
+  (registry, mmap) <- liftIO $ toPrometheusRegistry' store opts
+  mv <- liftIO $ newMVar mmap
+  return (registry, updateMetrics store opts registry mv >> Prometheus.sample registry)
 
 --------------------------------------------------------------------------------
 toPrometheusRegistry' :: EKG.Store -> AdapterOptions -> IO (Prometheus.Registry, MetricsMap)
 toPrometheusRegistry' store opts = do
-  let registry = Prometheus.new
+  registry <- Prometheus.new
   samples <- EKG.sampleAll store
-  foldM (mkMetric opts) (registry, Map.empty) (HMap.toList samples)
+  mmap <- HMap.fromList . catMaybes <$> traverse (mkMetric opts registry) (HMap.toList samples)
+  return (registry, mmap)
 
 --------------------------------------------------------------------------------
 toPrometheusRegistry :: EKG.Store -> AdapterOptions -> IO Prometheus.Registry
 toPrometheusRegistry store opts = fst <$> toPrometheusRegistry' store opts
 
 --------------------------------------------------------------------------------
-mkMetric :: AdapterOptions -> (Prometheus.Registry, MetricsMap) -> (T.Text, EKG.Value) -> IO (Prometheus.Registry, MetricsMap)
-mkMetric AdapterOptions{..} (oldRegistry, mmap) (key, value) = do
+mkMetric :: AdapterOptions -> Prometheus.Registry -> (T.Text, EKG.Value) -> IO (Maybe (Prometheus.Name, Metric))
+mkMetric AdapterOptions{..} registry (key, value) = do
   let k = mkKey _namespace key
   case value of
    EKG.Counter c -> do
-     (counter, newRegistry) <- Prometheus.registerCounter k _labels oldRegistry
-     Counter.add (fromIntegral c) counter
-     return $! (newRegistry, Map.insert k (C counter) $! mmap)
+     counter <- Prometheus.registerCounter k _labels registry
+     let c' = fromIntegral c
+     when (c' > 0) (Counter.add c' counter)
+     return (Just (k, C counter))
    EKG.Gauge g   -> do
-     (gauge, newRegistry) <- Prometheus.registerGauge k _labels oldRegistry
+     gauge <- Prometheus.registerGauge k _labels registry
      Gauge.set (fromIntegral g) gauge
-     return $! (newRegistry, Map.insert k (G gauge) $! mmap)
-   EKG.Label _   -> return $! (oldRegistry, mmap)
-   EKG.Distribution _ -> return $! (oldRegistry, mmap)
+     return (Just (k, G gauge))
+   EKG.Label _   -> return Nothing
+   EKG.Distribution stats -> do
+     let statGauge name = do
+           gauge <- Prometheus.registerGauge k ( Prometheus.addLabel "stat" name _labels) registry
+           return gauge
+     meanG <- statGauge "mean"
+     varianceG <- statGauge"variance"
+     countC <- Prometheus.registerCounter k (Prometheus.addLabel "stat" "count" _labels) registry
+     sumG <- statGauge"sum"
+     minG <- statGauge"min"
+     maxG <- statGauge"max"
+     let distribution = Distribution {..}
+     updateDistribution distribution stats
+     return (Just (k, D Distribution {..}))
 
+updateDistribution :: Distribution -> EKG.Stats -> IO ()
+updateDistribution Distribution{..} stats = do
+  Gauge.set (EKG.mean stats) meanG
+  Gauge.set (EKG.variance stats) varianceG
+  Gauge.set (EKG.sum stats) sumG
+  Gauge.set (EKG.min stats) minG
+  Gauge.set (EKG.max stats) maxG
+  updateCounter countC (EKG.count stats)
+
+updateCounter :: Counter.Counter -> Int64 -> IO ()
+updateCounter counter c = do
+  (Counter.CounterSample oldCounterValue) <- Counter.sample counter
+  let slack = c - fromIntegral oldCounterValue
+  when (slack >= 0) $ Counter.add (fromIntegral slack) counter
 --------------------------------------------------------------------------------
-updateMetrics :: EKG.Store -> AdapterOptions -> MetricsMap -> IO ()
-updateMetrics store opts mmap = do
+updateMetrics :: EKG.Store -> AdapterOptions -> Prometheus.Registry -> MVar MetricsMap -> IO ()
+updateMetrics store opts registry mmap = do
   samples <- EKG.sampleAll store
-  const () <$> foldM (updateMetric opts) mmap (HMap.toList samples)
-
+  traverse_ (updateMetric opts registry mmap) (HMap.toList samples)
 
 --------------------------------------------------------------------------------
 mkKey :: Maybe T.Text -> T.Text -> Prometheus.Name
 mkKey mbNs k =
-  Prometheus.Name $ (maybe mempty (\x -> x <> "_") mbNs) <> T.replace "." "_" k
+  -- TODO forbid digit as first character
+  Prometheus.Name $ ns <> T.map replace_ k
+  where
+    ns = maybe mempty (<> "_") mbNs
+    allowed c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+    replace_ c = if allowed c then c else '_'
 
 --------------------------------------------------------------------------------
-updateMetric :: AdapterOptions -> MetricsMap -> (T.Text, EKG.Value) -> IO MetricsMap
-updateMetric AdapterOptions{..} mmap (key, value) = do
+updateMetric :: AdapterOptions -> Prometheus.Registry -> MVar MetricsMap -> (T.Text, EKG.Value) -> IO ()
+updateMetric opts@AdapterOptions{..} registry mv kv@(key, value) = do
   let k = mkKey _namespace key
-  case liftM2 (,) (Map.lookup k mmap) (Just value) of
-    Just (C counter, EKG.Counter c)  -> do
-      (Counter.CounterSample oldCounterValue) <- Counter.sample counter
-      let slack = c - fromIntegral oldCounterValue
-      when (slack >= 0) $ Counter.add (fromIntegral slack) counter
-      return $! mmap
-    Just (G gauge,   EKG.Gauge g) -> do
-      Gauge.set (fromIntegral g) gauge
-      return $! mmap
-    _ -> return mmap
+  mmap <- readMVar mv
+  case HMap.lookup k mmap of
+    Just metric -> updateMetric' metric value
+    Nothing -> modifyMVar_ mv $ \mmap -> do
+      -- take the MMap MVar before the Registry, so we never register two metrics for the same EKG
+      m_metric <- mkMetric opts registry kv
+      case m_metric of
+        Nothing -> return mmap
+        Just (_, metric) -> do
+          updateMetric' metric value
+          return $ HMap.insert k metric mmap
+  where
+    updateMetric' :: Metric -> EKG.Value -> IO ()
+    updateMetric' metric value = case (metric, value) of
+      (C counter, EKG.Counter c)  -> updateCounter counter c
+      (G gauge,   EKG.Gauge g) -> Gauge.set (fromIntegral g) gauge
+      (D distribution, EKG.Distribution stats) -> updateDistribution distribution stats
+      _ -> return ()
