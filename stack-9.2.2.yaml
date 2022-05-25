@@ -1,0 +1,11 @@
+resolver: nightly-2022-05-25
+allow-newer: true
+packages:
+- '.'
+
+extra-deps:
+  - prometheus-2.2.3
+  - ekg-core-0.1.1.7
+
+flags: {}
+extra-package-dbs: []

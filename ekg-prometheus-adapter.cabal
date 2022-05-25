@@ -1,5 +1,5 @@
 name:                ekg-prometheus-adapter
-version:             0.1.0.5
+version:             0.2.0.0
 synopsis:            Easily expose your EKG metrics to Prometheus
 description:         Please see README.md
 homepage:            https://github.com/adinapoli/ekg-prometheus-adapter#readme
@@ -18,7 +18,7 @@ library
   hs-source-dirs:      src
   exposed-modules:     System.Remote.Monitoring.Prometheus
   build-depends:       base >= 4.7 && < 5
-                     , prometheus >= 0.4.0 && < 3.0.0
+                     , prometheus >= 2.0.0 && < 3.0.0
                      , containers >= 0.6.7 && < 0.8
                      , ekg-core >= 0.1.1 && < 0.2
                      , text >= 2.0.2 && < 2.2
