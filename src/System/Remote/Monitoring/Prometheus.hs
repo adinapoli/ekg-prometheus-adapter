@@ -7,6 +7,7 @@
 module System.Remote.Monitoring.Prometheus
   ( toPrometheusRegistry
   , registerEKGStore
+  , registerEKGStore'
   , AdapterOptions(..)
   , labels
   , namespace
@@ -52,7 +53,15 @@ defaultOptions l = AdapterOptions l Nothing 15
 
 --------------------------------------------------------------------------------
 registerEKGStore :: MonadIO m => EKG.Store -> AdapterOptions -> RegistryT m ()
-registerEKGStore store opts = RegistryT $ ReaderT $ \registry -> liftIO $ do
+registerEKGStore store opts = RegistryT $ ReaderT $ \registry ->
+  liftIO $ registerEKGStore' store opts registry
+
+--------------------------------------------------------------------------------
+-- | Like 'registerEKGStore', but takes the concurrent 'Prometheus.Registry'
+-- explicitly. Useful when the registry handle is managed outside of
+-- 'RegistryT' (e.g. shared with other components of the application).
+registerEKGStore' :: EKG.Store -> AdapterOptions -> Prometheus.Registry -> IO ()
+registerEKGStore' store opts registry = do
   mmap <- toPrometheusRegistry' registry store opts
   void $ forkIO $ forever $ do
     threadDelay (_samplingFrequency opts * (1_000_000 :: Int))
@@ -98,7 +107,7 @@ mkMetric AdapterOptions{..} registry mmap (!key, !value) = do
 updateMetrics :: EKG.Store -> AdapterOptions -> MetricsMap -> IO ()
 updateMetrics store opts mmap = do
   samples <- EKG.sampleAll store
-  const () <$> foldM (updateMetric opts) mmap (HMap.toList samples)
+  forM_ (HMap.toList samples) (updateMetric opts mmap)
 
 
 --------------------------------------------------------------------------------
@@ -107,7 +116,7 @@ mkKey mbNs k =
   Prometheus.Name $ (maybe mempty (\x -> x <> "_") mbNs) <> T.replace "." "_" k
 
 --------------------------------------------------------------------------------
-updateMetric :: AdapterOptions -> MetricsMap -> (T.Text, EKG.Value) -> IO MetricsMap
+updateMetric :: AdapterOptions -> MetricsMap -> (T.Text, EKG.Value) -> IO ()
 updateMetric AdapterOptions{..} mmap (!key, !value) = do
   let k = mkKey _namespace key
   case Map.lookup k mmap of
@@ -116,9 +125,7 @@ updateMetric AdapterOptions{..} mmap (!key, !value) = do
      -> do (Counter.CounterSample oldCounterValue) <- Counter.sample counter
            let slack = c - fromIntegral oldCounterValue
            when (slack >= 0) $ Counter.add (fromIntegral slack) counter
-           pure $! mmap
     Just (G gauge)
       | EKG.Gauge g <- value
-      -> do Gauge.set (fromIntegral g) gauge
-            pure $! mmap
-    _ -> pure mmap
+      -> Gauge.set (fromIntegral g) gauge
+    _ -> pure ()
