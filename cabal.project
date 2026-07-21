@@ -1,6 +1,1 @@
 packages: .
-
-allow-newer:
-  ekg-core:base,
-  ekg-core:ghc-prim,
-
