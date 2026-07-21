@@ -1,5 +1,6 @@
+cabal-version:       2.4
 name:                ekg-prometheus-adapter
-version:             0.1.0.5
+version:             0.2.0.0
 synopsis:            Easily expose your EKG metrics to Prometheus
 description:         Please see README.md
 homepage:            https://github.com/adinapoli/ekg-prometheus-adapter#readme
@@ -10,20 +11,20 @@ maintainer:          alfredo.dinapoli@gmail.com
 copyright:           2016 Alfredo Di Napoli
 category:            Web
 build-type:          Simple
--- extra-source-files:
-cabal-version:       >=1.10
-tested-with: GHC == 9.4.7 || == 9.4.8 || == 9.6.4 || == 9.10.1
+tested-with:         GHC == 9.6.7
+                   , GHC == 9.10.3
+extra-doc-files:     README.md
 
 library
   hs-source-dirs:      src
   exposed-modules:     System.Remote.Monitoring.Prometheus
-  build-depends:       base >= 4.7 && < 5
-                     , prometheus >= 0.4.0 && < 3.0.0
-                     , containers >= 0.6.7 && < 0.8
-                     , ekg-core >= 0.1.1 && < 0.2
-                     , text >= 2.0.2 && < 2.2
+  build-depends:       base >= 4.18 && < 5
+                     , prometheus >= 2.0.0 && < 3
+                     , ekg-core >= 0.1.1.7 && < 0.2
                      , unordered-containers >= 0.2.20 && < 0.3
-                     , transformers >= 0.5.6 && < 0.7
+                     , containers >= 0.6.7 && < 0.9
+                     , text >= 2.0.2 && < 2.2
+                     , mtl < 2.4
                      , microlens-th >= 0.4.3 && < 0.5
   default-language:    Haskell2010
 
